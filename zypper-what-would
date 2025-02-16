@@ -1,0 +1,312 @@
+#!/bin/bash -e
+
+# begin-section=functions
+
+function join_by { local IFS="$1"; shift; echo "$*"; }
+
+function run_command {
+  echo "DEBUG: Running $@" >&2;
+
+  "$@"
+}
+# end-section=functions
+
+# begin-section=templates
+source /etc/os-release
+CDX_HEADER="$(cat <<EOF
+bomFormat: "CycloneDX"
+specVersion: "1.5"
+version: 1
+metadata:
+  tools:
+    - name: "zypper-dup-what-will-happen"
+      version: "1.1"
+  component:
+     bom-ref: "root"
+     name: "zypper-dup-what-will-happen"
+     type: "application"
+components:
+- type: "operating-system"
+  name: "$ID"
+  version: "$VERSION_ID"
+EOF
+)"
+
+FMT_CDX_COMPONENT_STR="$(cat <<EOF
+- type: "library"
+  name: "%{NAME}"
+  version: "%{VERSION}.%{RELEASE}"
+  publisher: "%{VENDOR}"
+  licenses: \[\]
+  arch: "%{ARCH}"
+  upstream: "%{SOURCERPM}"
+  bom-ref: "pkg:rpm/%{NAME}-%{PKGID}"
+  components:
+  [- type: "file"
+    name: "%{FILENAMES}"
+    hashes:
+      - alg: "SHA-256"
+        content: "%{FILEDIGESTS}"
+  ]
+EOF
+)"
+
+# FMT_FILE_DETAILS="[%{FILEDIGESTS}|%{FILENAMES}\n]"
+FMT_FILE_DETAILS="[%{FILEDIGESTS}|%{FILENAMES}|%{FILELINKTOS}|%{FILEMODES:perms}|%{FILEFLAGS:fflags}\n]"
+
+YQ_PROG_BUILD_PURL="$(cat <<'EOF'
+(. | map( .purl = "pkg:rpm/"
+    + (
+            .publisher | downcase | split(" ")
+        )[0]
+        + "/"
+        + .name
+        + "@"
+        + .version
+        + "?"
+        + (
+                [
+                    ["epoch", .epoch],
+                    ["arch", .arch],
+                    ["upstream", .upstream]
+                ] | map( . | join("=")
+            ) | join("&")
+        )
+    )
+)
+EOF
+)"
+# end-section=templates
+
+# begin-section=check-dependencies
+command -v rpm find yq tee sort trivy column 2>&1 >/dev/null
+
+if [[ $? != 0 ]]; then
+    echo "Missing dependencies: rpm find yq tee"
+    echo "- yq: https://github.com/mikefarah/yq"
+    echo "- trivy: https://github.com/aquasecurity/trivy"
+    exit 1
+fi
+
+# end-section=check-dependencies
+
+# begin-section=arg-parse
+function show_help {
+    echo "USAGE: zypper what-would <operation> [-C] [-D cache_dir] [-h] [-Z <zypper-global-flags>] [...command args]"
+    echo "---"
+    echo "Supported operations:"
+    echo " - in"
+    echo " - up"
+    echo " - dup"
+}
+
+OPTIND=1
+
+CLEAN=
+WITH_VULN="no"
+ZYPPER_CMD_FLAGS=""
+ZYPPER_GLOBAL_FLAGS=""
+CACHE_DIR="${CACHE_DIR:-/tmp/zdwwh-cache/}"
+
+while getopts ":hVC:D:Z:" opt; do
+  case "$opt" in
+    h)
+      show_help
+      exit 0
+      ;;
+    D)
+      CACHE_DIR="$OPTARG"
+      ;;
+    C)
+      CLEAN=yes
+      ;;
+    Z)
+      ZYPPER_GLOBAL_FLAGS="$OPTARG"
+      ;;
+    V)
+      WITH_VULN="yes"
+      ;;
+  esac
+done
+shift $((($OPTIND) - 1))
+
+OPERATION=$1
+shift || (echo -e "ERROR: Missing operation!\n"; show_help; exit 2)
+
+case "$OPERATION" in
+    up|dup|in)
+      ;;
+    ?)
+        echo "ERROR: Unsupported operation '$OPERATION'"
+        show_help
+        exit 2
+    ;;
+esac
+
+ZYPPER_CMD_FLAGS=$@
+# end-section=arg-parse
+
+# begin-section=main
+
+# echo "OPERATION=$OPERATION"
+# echo "ZYPPER_GLOBAL_FLAGS=$ZYPPER_GLOBAL_FLAGS"
+# echo "Remaining arguments are: $@"
+
+echo "Debug: What would happen if we run 'zypper $ZYPPER_GLOBAL_FLAGS $OPERATION $ZYPPER_CMD_FLAGS'?"
+
+if [[ ! -z "$CLEAN" ]]; then
+    echo "Cleaning up the cache at $CACHE_DIR"
+    run_command rm -rf -I "$CACHE_DIR"
+fi
+
+run_command mkdir -p $CACHE_DIR
+
+echo ""
+run_command zypper --pkg-cache-dir $CACHE_DIR $ZYPPER_GLOBAL_FLAGS "$OPERATION" --dry-run --download-only --details $ZYPPER_CMD_FLAGS
+
+new_files_table=""
+good_files=""
+diff_table=""
+
+# This whole loop + detecting I prolly can do by parsing the output of sha256sum
+# instead of calling it every time 🤔
+while IFS='|' read HASH FILEPATH FILELINK FILEMODE FILEFLAGS
+do
+  if [[ -z "$FILEPATH" ]]; then
+    continue
+  fi
+
+  if [[ "$FILEFLAGS" == "g" ]]; then
+    echo >&2 "Skipping ghost file: $FILEMODE $FILEPATH"
+    continue
+  fi
+
+  declare -a row=();
+  # pre-populate the row
+  row[0]="~"
+  row[1]="~"
+  row[2]="~"
+  row[3]="~"
+  row[4]="~"
+
+  mode="${FILEMODE::1}"
+  exists=no
+
+  # normalize mode. "-" means file
+  [[ "$mode" == "-" ]] && mode="f" || true;
+
+  # check if it exists
+  test -e "$FILEPATH" && exists=yes || true
+
+  row[0]="$FILEPATH"
+  row[1]="$mode"
+
+
+  if [[ "$exists" == "no" ]]; then
+    row[2]="$HASH"
+    row[4]="➕"
+
+    new_files_table="$(echo -en "$new_files_table\n" $(join_by ',' "${row[@]}"))"
+    continue
+  fi
+
+  # from here all files exists
+  if [[ -z "$HASH" ]]; then
+    # if there's no hash that means is either a directory or a symlink.
+    # directories are meh, tracked as a success.
+    if [[ !  -L "$FILEPATH" ]]; then
+      row[4]="✅"
+      good_files="$(echo -en "$good_files\n" $(join_by ',' "${row[@]}"))"
+      continue
+    fi
+
+    # Links on the other hand we check that they point to the same file as the
+    # current state of the filesystem does.
+
+    # Not my strong suite here, but seems to work out fine
+    if [[ "${FILELINK::1}" == "/" ]]; then
+      CALC=$(realpath "$FILEPATH")
+    else
+      CALC=$(realpath --relative-to=$(dirname "$FILEPATH") $(realpath "$FILEPATH"))
+    fi
+
+    row[2]="$FILEPATH -> $CALC"
+    row[3]="$FILEPATH -> $FILELINK"
+
+    if [[ "$CALC" == "$FILELINK" ]];
+    then
+      row[4]="✅"
+    else
+      row[4]="❌"
+    fi
+  else
+    row[2]="$HASH"
+
+    # this works:
+    # sha256sum -c --quiet --status <<< "$HASH $FILEPATH"
+    # but doesn't tell me the computed sha256 I wanna present the differences
+    # gotta parse the full output
+
+    read got _path <<< $(sha256sum "$FILEPATH")
+    row[3]="$got"
+
+    if [[ "${row[2]}" == "${row[3]}" ]];
+    then
+      row[4]="✅"
+    else
+      row[4]="❌"
+    fi
+  fi
+
+  if [[ "${row[4]}" == "✅" ]];
+  then
+    good_files="$(echo -en "$good_files\n" $(join_by ',' "${row[@]}"))"
+    continue
+  fi
+
+  diff_table="$(echo -en "$diff_table\n" $(join_by ',' "${row[@]}"))"
+done <<< $(run_command rpm --qf "${FMT_FILE_DETAILS}" -qp $(find "$CACHE_DIR" -type f -iname '*.rpm'))
+
+echo "== SUMMARY OF THE CHANGES =="
+
+echo ""
+echo "FILES WITHOUT CHANGES"
+echo "---------"
+if [[ -z "$good_files" ]];
+then
+  echo "No files unchanged"
+else
+  echo "$good_files" | sort -k "5" -t "," | column -t -s, -N "Path,Type,Expected Digest,Calculated Digest,Check"
+fi
+
+echo ""
+echo "NEW FILES"
+echo "---------"
+if [[ -z "$new_files_table" ]];
+then
+  echo "No new files"
+else
+  echo "$new_files_table" | column -t -s, -N "Path,Type,Expected Digest,Calculated Digest,Check"
+fi
+
+echo ""
+echo "MODIFIED FILES"
+echo "--------------"
+if [[ -z "$diff_table" ]];
+then
+  echo "No different files"
+else
+  echo "$diff_table" | sort -k "5" -t "," | column -t -s, -N "Path,Type,Expected Digest,Calculated Digest,Check"
+fi
+
+if [[ "$WITH_VULN" == "yes" ]]; then
+  echo ""
+  echo "VULN ANALYSYS (Trivy)"
+  echo "---------------------"
+  echo "$CDX_HEADER" > sbom_doc.yml 
+  run_command rpm --qf "${FMT_CDX_COMPONENT_STR}\n\n" -qp $(find "$CACHE_DIR" -type f -iname '*.rpm') | yq "$YQ_PROG_BUILD_PURL" >> sbom_doc.yml
+  run_command yq -o json < sbom_doc.yml > sbom_doc.json
+  trivy sbom sbom_doc.json
+fi
+
+# end-section=main
