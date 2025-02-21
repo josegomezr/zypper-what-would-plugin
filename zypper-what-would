@@ -3,6 +3,23 @@
 # begin-section=functions
 
 function join_by { local IFS="$1"; shift; echo "$*"; }
+function convert_file_type {
+  type="$1"
+  case "$type" in
+    "f" )
+      echo "file"
+      ;;
+    "d" )
+      echo "directory"
+      ;;
+    "l" )
+      echo "link"
+      ;;
+    *)
+      echo "unknown ($type)"
+      ;;
+  esac
+}
 
 function run_command {
   echo "DEBUG: Running $@" >&2;
@@ -19,12 +36,12 @@ specVersion: "1.5"
 version: 1
 metadata:
   tools:
-    - name: "zypper-dup-what-will-happen"
-      version: "1.1"
+    - name: "zypper-what-would-plugin"
+      version: "1.0.0"
   component:
-     bom-ref: "root"
-     name: "zypper-dup-what-will-happen"
-     type: "application"
+    bom-ref: "root"
+    name: "zypper-what-would-plugin"
+    type: "application"
 components:
 - type: "operating-system"
   name: "$ID"
@@ -32,11 +49,16 @@ components:
 EOF
 )"
 
+# per-package script detection
+# TODO: use this somehow to reflect the presence of scripts on packages.
+# scripts: ~%|PREINPROG?{,pre-in}:{}|%|POSTINPROG?{,post-in}:{}|%|PREUNPROG?{,pre-un}:{}|%|POSTUNPROG?{,post-un}:{}|%|VERIFYSCRIPTPROG?{,verifyscript}:{}|%|TRIGGERSCRIPTPROG?{,triggerscript}:{}|%|PRETRANSPROG?{,pre-trans}:{}|%|POSTTRANSPROG?{,post-trans}:{}|%|FILETRIGGERSCRIPTPROG?{,file-trigger-script}:{}|%|TRANSFILETRIGGERSCRIPTPROG?{,trans-file-trigger-script}:{}|%|PREUNTRANSPROG?{,pre-un-trans}:{}|%|POSTUNTRANSPROG?{,post-un-trans}:{}|
+
 FMT_CDX_COMPONENT_STR="$(cat <<EOF
 - type: "library"
   name: "%{NAME}"
   version: "%{VERSION}.%{RELEASE}"
   publisher: "%{VENDOR}"
+  digest-algorithm: "digest-algo-id-%{FILEDIGESTALGO}"
   licenses: \[\]
   arch: "%{ARCH}"
   upstream: "%{SOURCERPM}"
@@ -51,48 +73,33 @@ FMT_CDX_COMPONENT_STR="$(cat <<EOF
 EOF
 )"
 
-# FMT_FILE_DETAILS="[%{FILEDIGESTS}|%{FILENAMES}\n]"
 FMT_FILE_DETAILS="[%{FILEDIGESTS}|%{FILENAMES}|%{FILELINKTOS}|%{FILEMODES:perms}|%{FILEFLAGS:fflags}\n]"
 
 YQ_PROG_BUILD_PURL="$(cat <<'EOF'
-(. | map( .purl = "pkg:rpm/"
+. | map(
+  .purl = "pkg:rpm/"
+    + (.publisher | downcase | split(" "))[0]
+    + "/"
+    + .name
+    + "@"
+    + .version
+    + "?"
     + (
-            .publisher | downcase | split(" ")
-        )[0]
-        + "/"
-        + .name
-        + "@"
-        + .version
-        + "?"
-        + (
-                [
-                    ["epoch", .epoch],
-                    ["arch", .arch],
-                    ["upstream", .upstream]
-                ] | map( . | join("=")
-            ) | join("&")
-        )
+        [
+          ["epoch", .epoch],
+          ["arch", .arch],
+          ["upstream", .upstream]
+        ] | map( . | join("=")
+      ) | join("&")
     )
-)
+  )
 EOF
 )"
 # end-section=templates
 
-# begin-section=check-dependencies
-command -v rpm find yq tee sort trivy column 2>&1 >/dev/null
-
-if [[ $? != 0 ]]; then
-    echo "Missing dependencies: rpm find yq tee"
-    echo "- yq: https://github.com/mikefarah/yq"
-    echo "- trivy: https://github.com/aquasecurity/trivy"
-    exit 1
-fi
-
-# end-section=check-dependencies
-
 # begin-section=arg-parse
 function show_help {
-    echo "USAGE: zypper what-would <operation> [-C] [-D cache_dir] [-h] [-Z <zypper-global-flags>] [...command args]"
+    echo "USAGE: zypper what-would <operation> [-M {all | only-differences}] [-O {table | yaml}] [-C] [-D cache_dir] [-h] [-Z <zypper-global-flags>] [...command args]"
     echo "---"
     echo "Supported operations:"
     echo " - in"
@@ -103,12 +110,14 @@ function show_help {
 OPTIND=1
 
 CLEAN=
+OUTPUT=table
+MODE=all
 WITH_VULN="no"
 ZYPPER_CMD_FLAGS=""
 ZYPPER_GLOBAL_FLAGS=""
-CACHE_DIR="${CACHE_DIR:-/tmp/zdwwh-cache/}"
+CACHE_DIR="${CACHE_DIR:-$(mktemp -d /tmp/zypper-ww.XXXXXX)}"
 
-while getopts ":hVC:D:Z:" opt; do
+while getopts ":hVC:D:Z:O:M:" opt; do
   case "$opt" in
     h)
       show_help
@@ -119,6 +128,36 @@ while getopts ":hVC:D:Z:" opt; do
       ;;
     C)
       CLEAN=yes
+      ;;
+    M)
+      case "$OPTARG" in
+        "all" )
+          MODE=all
+          ;;
+        "only-differences" )
+          MODE=only-differences
+          ;;
+        *)
+          echo -e "ERROR: Unknown mode '$OPTARG'\n";
+          show_help;
+          exit 1
+          ;;
+      esac
+      ;;
+    O)
+      case "$OPTARG" in
+        "table" )
+          OUTPUT=table
+          ;;
+        "yaml" )
+          OUTPUT=yaml
+          ;;
+        *)
+          echo -e "ERROR: Unknown output format '$OPTARG'\n";
+          show_help;
+          exit 1
+          ;;
+      esac
       ;;
     Z)
       ZYPPER_GLOBAL_FLAGS="$OPTARG"
@@ -143,6 +182,21 @@ case "$OPERATION" in
     ;;
 esac
 
+# begin-section=check-dependencies
+DEPS="zypper rpm find yq tee sort column"
+if [[ "$WITH_VULN" == "yes" ]]; then
+  DEPS="${DEPS} trivy"
+fi
+command -v $DEPS 2>&1 >/dev/null
+
+if [[ $? != 0 ]]; then
+    echo "Missing dependencies: rpm find yq tee"
+    echo "- yq: https://github.com/mikefarah/yq"
+    echo "- trivy: https://github.com/aquasecurity/trivy"
+    exit 1
+fi
+# end-section=check-dependencies
+
 ZYPPER_CMD_FLAGS=$@
 # end-section=arg-parse
 
@@ -152,17 +206,83 @@ ZYPPER_CMD_FLAGS=$@
 # echo "ZYPPER_GLOBAL_FLAGS=$ZYPPER_GLOBAL_FLAGS"
 # echo "Remaining arguments are: $@"
 
-echo "Debug: What would happen if we run 'zypper $ZYPPER_GLOBAL_FLAGS $OPERATION $ZYPPER_CMD_FLAGS'?"
+echo "Debug: What would happen if we run 'zypper $ZYPPER_GLOBAL_FLAGS $OPERATION $ZYPPER_CMD_FLAGS'?" >&2
 
-if [[ ! -z "$CLEAN" ]]; then
-    echo "Cleaning up the cache at $CACHE_DIR"
-    run_command rm -rf -I "$CACHE_DIR"
-fi
+function cleanup() {
+  if [[ ! -z "$CLEAN" ]]; then
+      echo "Cleaning up the cache at $CACHE_DIR" >&2
+      run_command rm -rf $EXTRA_ARGS "$CACHE_DIR"
+  else
+      echo "Preserving cache at $CACHE_DIR" >&2
+  fi
+}
+
+trap cleanup EXIT
 
 run_command mkdir -p $CACHE_DIR
 
-echo ""
-run_command zypper --pkg-cache-dir $CACHE_DIR $ZYPPER_GLOBAL_FLAGS "$OPERATION" --dry-run --download-only --details $ZYPPER_CMD_FLAGS
+echo "" >&2
+# set +e
+# run_command zypper --pkg-cache-dir $CACHE_DIR $ZYPPER_GLOBAL_FLAGS "$OPERATION" --dry-run --download-only --details $ZYPPER_CMD_FLAGS >&2
+# ZYPP_ERR=$?
+# set -e
+for rpm_file in $(find "$CACHE_DIR" -type f -iname '*.rpm')
+do
+  sha256sum $rpm_file | cut -f1 -d' ' > "${rpm_file}.sha256sum"
+done
+
+ZYPP_ERR_CODE=
+ZYPP_ERR_DESC=
+
+case "$ZYPP_ERR" in
+  "102" )
+  ZYPP_ERR_CODE=ZYPPER_EXIT_INF_REBOOT_NEEDED
+  ZYPP_ERR_DESC=$(cat <<-EOF
+  Returned by the needs-rebooting command, if a system reboot is suggested.
+
+  Legacy: Returned after the successful installation of a patch which requires
+  reboot of computer. This legacy behavior is kept, but it’s drawback is that
+  it covers patches only, no packages. The new needs-rebooting command is the
+  recommended way to test whether a system reboot is suggested.
+EOF
+  )
+    ;;
+  "103" )
+  ZYPP_ERR_CODE=ZYPPER_EXIT_INF_RESTART_NEEDED
+  ZYPP_ERR_DESC=$(cat <<-EOF
+  Returned after a successful installation of a patch which requires restart of
+  the package manager itself. This means that one of patches to be installed
+  affects the package manager itself and the command used (e.g. zypper update)
+  needs to be executed once again to install any remaining patches.
+EOF
+  )
+    ;;
+  "105" )
+  ZYPP_ERR_CODE=ZYPPER_EXIT_ON_SIGNAL
+  ZYPP_ERR_DESC=$(cat <<-EOF
+  Returned upon exiting after receiving a SIGINT or SIGTERM.
+EOF
+  )
+    ;;
+  "106" )
+  ZYPP_ERR_CODE=ZYPPER_EXIT_INF_REPOS_SKIPPED
+  ZYPP_ERR_DESC=$(cat <<-EOF
+  Some repository had to be disabled temporarily because it failed to refresh.
+  You should check your repository configuration (e.g. zypper ref -f).
+EOF
+  )
+    ;;
+esac
+
+
+if [[ ! -z "$ZYPP_ERR_CODE" ]]; then
+  echo "Zypper has exited with status = $ZYPP_ERR"  >&2
+  echo "$ZYPP_ERR_CODE ($ZYPP_ERR)"  >&2
+  echo "---"  >&2
+  echo "$ZYPP_ERR_DESC"  >&2
+  echo "---"  >&2
+  echo "Will proceed anyways..."  >&2
+fi
 
 new_files_table=""
 good_files=""
@@ -206,7 +326,7 @@ do
     row[2]="$HASH"
     row[4]="➕"
 
-    new_files_table="$(echo -en "$new_files_table\n" $(join_by ',' "${row[@]}"))"
+    new_files_table="$(echo -en "$new_files_table"$(join_by ',' "${row[@]}"))\n"
     continue
   fi
 
@@ -216,7 +336,7 @@ do
     # directories are meh, tracked as a success.
     if [[ !  -L "$FILEPATH" ]]; then
       row[4]="✅"
-      good_files="$(echo -en "$good_files\n" $(join_by ',' "${row[@]}"))"
+      good_files="$(echo -en "$good_files"$(join_by ',' "${row[@]}"))\n"
       continue
     fi
 
@@ -260,43 +380,137 @@ do
 
   if [[ "${row[4]}" == "✅" ]];
   then
-    good_files="$(echo -en "$good_files\n" $(join_by ',' "${row[@]}"))"
+    good_files="$(echo -en "$good_files"$(join_by ',' "${row[@]}"))\n"
     continue
   fi
 
-  diff_table="$(echo -en "$diff_table\n" $(join_by ',' "${row[@]}"))"
+  diff_table="$(echo -en "$diff_table"$(join_by ',' "${row[@]}"))\n"
 done <<< $(run_command rpm --qf "${FMT_FILE_DETAILS}" -qp $(find "$CACHE_DIR" -type f -iname '*.rpm'))
 
-echo "== SUMMARY OF THE CHANGES =="
+if [[ "$OUTPUT" == "table" ]]; then
+  echo "== SUMMARY OF THE CHANGES =="
 
-echo ""
-echo "FILES WITHOUT CHANGES"
-echo "---------"
-if [[ -z "$good_files" ]];
-then
-  echo "No files unchanged"
-else
-  echo "$good_files" | sort -k "5" -t "," | column -t -s, -N "Path,Type,Expected Digest,Calculated Digest,Check"
-fi
+  if [[ "$MODE" != "only-differences" ]]; then
+    echo ""
+    echo "FILES WITHOUT CHANGES"
+    echo "---------"
+    if [[ -z "$good_files" ]];
+    then
+      echo "No files unchanged"
+    else
+      echo "$good_files" | sort -k "5" -t "," | column -t -s, -N "Path,Type,Expected Digest,Calculated Digest,Check"
+    fi
+  fi
 
-echo ""
-echo "NEW FILES"
-echo "---------"
-if [[ -z "$new_files_table" ]];
-then
-  echo "No new files"
-else
-  echo "$new_files_table" | column -t -s, -N "Path,Type,Expected Digest,Calculated Digest,Check"
-fi
+  echo ""
+  echo "NEW FILES"
+  echo "---------"
+  if [[ -z "$new_files_table" ]];
+  then
+    echo "No new files"
+  else
+    echo "$new_files_table" | column -t -s, -N "Path,Type,Expected Digest,Calculated Digest,Check"
+  fi
 
-echo ""
-echo "MODIFIED FILES"
-echo "--------------"
-if [[ -z "$diff_table" ]];
-then
-  echo "No different files"
-else
-  echo "$diff_table" | sort -k "5" -t "," | column -t -s, -N "Path,Type,Expected Digest,Calculated Digest,Check"
+  echo ""
+  echo "MODIFIED FILES"
+  echo "--------------"
+  if [[ -z "$diff_table" ]];
+  then
+    echo "No different files"
+  else
+    echo "$diff_table" | sort -k "5" -t "," | column -t -s, -N "Path,Type,Expected Digest,Calculated Digest,Check"
+  fi
+elif [[ "$OUTPUT" == "yaml" ]]; then
+  # This has to be one of the most cursed pieces of bash code I've ever written...
+  # I apologize for the emotional damage the following lines may cause.
+
+  cat <<EOF
+---
+title: Zypper "what-would" report
+attempted-command: zypper $ZYPPER_GLOBAL_FLAGS $OPERATION $ZYPPER_CMD_FLAGS
+created-at: "$(date +"%F %R:%S %Z")"
+cache-dir: $CACHE_DIR
+rpms-involved:
+EOF
+
+  for rpm_file in $(find "$CACHE_DIR" -type f -iname '*.rpm' | sed "s#$CACHE_DIR/##g")
+  do
+    echo "  - filename: $rpm_file"
+    echo "    sha256-digest: $(cat "${CACHE_DIR}/${rpm_file}.sha256sum")"
+  done
+  echo ""
+
+  if [[ "$MODE" != "only-differences" ]]; then
+    echo "unchanged-files:"
+    if [[ -z "$good_files" ]];
+    then
+      echo "  []"
+    else
+      while IFS=',' read path type expecteddigest calculateddigest check
+      do
+        type=$(convert_file_type "$type")
+        echo "  - path: $path"
+        echo "    type: $type"
+        if [[ "$type" == "file" ]]; then
+          echo "    expected-digest: '$expecteddigest'"
+          echo "    calculated-digest: '$calculateddigest'"
+        elif [[ "$type" == "directory" ]]; then
+          true
+        else
+          echo "    expected-location: '$expecteddigest'"
+          echo "    calculated-location: '$calculateddigest'"
+        fi
+      done <<< "$good_files"
+      echo ""
+    fi
+  fi
+
+  echo "new-files:"
+  if [[ -z "$new_files_table" ]];
+  then
+    echo "  []"
+  else
+    while IFS=',' read path type expecteddigest calculateddigest check
+    do
+      type=$(convert_file_type "$type")
+      echo "  - path: $path"
+      echo "    type: $type"
+      if [[ "$type" == "file" ]]; then
+        echo "    expected-digest: '$expecteddigest'"
+        echo "    calculated-digest: '$calculateddigest'"
+      elif [[ "$type" == "directory" ]]; then
+        echo "    location: $expecteddigest"
+      else
+        echo "    expected-location: '$expecteddigest'"
+        echo "    calculated-location: '$calculateddigest'"
+      fi
+    done <<< "$new_files_table"
+    echo ""
+  fi
+
+  echo "changed-files:"
+  if [[ -z "$diff_table" ]];
+  then
+    echo "  []"
+  else
+    while IFS=',' read path type expecteddigest calculateddigest check
+    do
+      type=$(convert_file_type "$type")
+      echo "  - path: $path"
+      echo "    type: $type"
+      if [[ "$type" == "file" ]]; then
+        echo "    expected-digest: '$expecteddigest'"
+        echo "    calculated-digest: '$calculateddigest'"
+      elif [[ "$type" == "directory" ]]; then
+        echo "    location: $expecteddigest"
+      else
+        echo "    expected-location: '$expecteddigest'"
+        echo "    calculated-location: '$calculateddigest'"
+      fi
+    done <<< "$diff_table"
+    echo ""
+  fi
 fi
 
 if [[ "$WITH_VULN" == "yes" ]]; then
